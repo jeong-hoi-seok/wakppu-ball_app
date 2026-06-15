@@ -1,220 +1,284 @@
 import { useGLTF } from '@react-three/drei';
 import { type ThreeEvent, useFrame } from '@react-three/fiber/native';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import type { GLTF } from 'three-stdlib';
 
-import wakppuGlb from '@/assets/3d/wakppu.glb';
+import wakppuGlb from '@/assets/3d/clay_ball_sim_ready_01.glb';
+import { useClayStore } from '@/store/use-clay-store';
 
 type WakppuModelProps = {
   scale?: number;
 };
 
-const REST_SCALE = new THREE.Vector3(1, 1, 1);
-const PRESSED_SCALE = new THREE.Vector3(1.2, 0.75, 1.2);
-const SCALE_LERP = 10;
-const STRENGTH_LERP = 14;
-const PRESS_RADIUS = 0.9;
-const PRESS_STRENGTH_MAX = 0.45;
-const SHATTER_HOLD = 1.0;
-const RESET_DELAY_MS = 1800;
-const FRAG_COUNT = 48;
-const GRAVITY = -5;
-const FRAG_BURST_SPEED = 3.5;
+const DEFORM_RADIUS = 0.25;
+const DEFORM_STRENGTH = 0.04;
+const MAX_DEPTH = 0.25;
+const PAINT_MIX = 0.35;
+const MORPH_LERP_SPEED = 8;
 
-const VERTEX_REPLACE = /* glsl */ `
-  vec3 transformed = vec3(position);
-  vec4 wakWorldP = modelMatrix * vec4(position, 1.0);
-  float wakD = distance(wakWorldP.xyz, uPressPoint);
-  float wakF = exp(-pow(wakD / max(uPressRadius, 0.0001), 2.0)) * uPressStrength;
-  transformed -= normal * wakF;
-`;
-
-type Fragment = {
-  pos: THREE.Vector3;
-  vel: THREE.Vector3;
-  rot: THREE.Euler;
-  angVel: THREE.Vector3;
-};
-
-const makeFragments = (origin: THREE.Vector3): Fragment[] =>
-  Array.from({ length: FRAG_COUNT }, () => {
-    const dir = new THREE.Vector3(
-      Math.random() - 0.5,
-      Math.random() - 0.5,
-      Math.random() - 0.5,
-    )
-      .normalize()
-      .multiplyScalar(FRAG_BURST_SPEED * (0.6 + Math.random() * 0.8));
-    dir.y += 1.5;
-    return {
-      pos: origin
-        .clone()
-        .add(
-          new THREE.Vector3(
-            (Math.random() - 0.5) * 0.3,
-            (Math.random() - 0.5) * 0.3,
-            (Math.random() - 0.5) * 0.3,
-          ),
-        ),
-      vel: dir,
-      rot: new THREE.Euler(),
-      angVel: new THREE.Vector3(
-        (Math.random() - 0.5) * 12,
-        (Math.random() - 0.5) * 12,
-        (Math.random() - 0.5) * 12,
-      ),
-    };
-  });
+type MorphRef = { index: number; influence: number };
 
 export const WakppuModel = ({ scale = 1 }: WakppuModelProps) => {
   const { scene } = useGLTF(wakppuGlb as unknown as string) as GLTF;
-  const groupRef = useRef<THREE.Group>(null);
-  const squashRef = useRef<THREE.Group>(null);
-  const fragMeshRef = useRef<THREE.InstancedMesh>(null);
-  const [pressed, setPressed] = useState(false);
-  const [phase, setPhase] = useState<'idle' | 'shattered'>('idle');
-  const pressTimeRef = useRef(0);
-  const fragsRef = useRef<Fragment[]>([]);
-  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const isPressingRef = useRef(false);
+  const originalPositionsRef = useRef<Float32Array | null>(null);
+  const originalColorsRef = useRef<Float32Array | null>(null);
+  const paintColorRef = useRef(new THREE.Color('#4382DF'));
+  const morphRef = useRef<MorphRef | null>(null);
 
-  const uniformsRef = useRef({
-    uPressPoint: { value: new THREE.Vector3(0, 0, 0) },
-    uPressRadius: { value: PRESS_RADIUS },
-    uPressStrength: { value: 0 },
-  });
+  const resetTick = useClayStore((s) => s.resetTick);
+  const wireframe = useClayStore((s) => s.wireframe);
+  const shapeKeyActive = useClayStore((s) => s.shapeKeyActive);
+  const selectedColor = useClayStore((s) => s.selectedColor);
+  const setMeshInfo = useClayStore((s) => s.setMeshInfo);
+  const setHit = useClayStore((s) => s.setHit);
+  const setStatus = useClayStore((s) => s.setStatus);
 
-  const { centeredScene, fitScale, fragColor } = useMemo(() => {
+  const { mesh, centeredScene, fitScale, debug } = useMemo(() => {
     const cloned = scene.clone(true);
+    let found: THREE.Mesh | null = null;
+    let meshCount = 0;
+    cloned.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        meshCount += 1;
+        if (!found) found = obj as THREE.Mesh;
+      }
+    });
+    if (!found) {
+      return {
+        mesh: null as THREE.Mesh | null,
+        centeredScene: cloned,
+        fitScale: 1,
+        debug: { meshCount, sceneChildren: cloned.children.length },
+      };
+    }
+    const m = found as THREE.Mesh;
+    m.geometry = m.geometry.clone();
+    const posAttr = m.geometry.attributes.position as THREE.BufferAttribute;
+
+    if (!m.geometry.attributes.color) {
+      const base = new THREE.Color('#AACCD6');
+      const arr = new Float32Array(posAttr.count * 3);
+      for (let i = 0; i < posAttr.count; i++) {
+        arr[i * 3] = base.r;
+        arr[i * 3 + 1] = base.g;
+        arr[i * 3 + 2] = base.b;
+      }
+      m.geometry.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+    }
+
+    const mats = Array.isArray(m.material) ? m.material : [m.material];
+    mats.forEach((mat) => {
+      const std = mat as THREE.MeshStandardMaterial;
+      std.vertexColors = true;
+      std.needsUpdate = true;
+    });
+
     const box = new THREE.Box3().setFromObject(cloned);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     cloned.position.sub(center);
     const maxDim = Math.max(size.x, size.y, size.z);
     const normalizedScale = maxDim > 0 ? 2 / maxDim : 1;
-
-    let pickedColor = new THREE.Color('#ffb86b');
-    cloned.traverse((obj) => {
-      if (!(obj instanceof THREE.Mesh)) return;
-      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-      mats.forEach((mat: THREE.Material) => {
-        const std = mat as THREE.MeshStandardMaterial;
-        if (std.color) pickedColor = std.color.clone();
-        mat.onBeforeCompile = (shader) => {
-          shader.uniforms.uPressPoint = uniformsRef.current.uPressPoint;
-          shader.uniforms.uPressRadius = uniformsRef.current.uPressRadius;
-          shader.uniforms.uPressStrength = uniformsRef.current.uPressStrength;
-          shader.vertexShader = shader.vertexShader.replace(
-            '#include <common>',
-            `#include <common>
-uniform vec3 uPressPoint;
-uniform float uPressRadius;
-uniform float uPressStrength;`,
-          );
-          shader.vertexShader = shader.vertexShader.replace(
-            '#include <begin_vertex>',
-            VERTEX_REPLACE,
-          );
-        };
-        mat.needsUpdate = true;
-      });
-    });
-
     return {
+      mesh: m,
       centeredScene: cloned,
       fitScale: normalizedScale * scale,
-      fragColor: pickedColor,
+      debug: {
+        meshCount,
+        sceneChildren: cloned.children.length,
+        bbox: [size.x, size.y, size.z] as [number, number, number],
+        maxDim,
+      },
     };
   }, [scene, scale]);
 
-  const triggerShatter = () => {
-    const worldOrigin = uniformsRef.current.uPressPoint.value.clone();
-    fragsRef.current = makeFragments(worldOrigin);
-    setPhase('shattered');
-    pressTimeRef.current = 0;
-    setTimeout(() => {
-      uniformsRef.current.uPressStrength.value = 0;
-      setPressed(false);
-      setPhase('idle');
-    }, RESET_DELAY_MS);
-  };
-
-  useFrame((_, delta) => {
-    if (phase === 'idle') {
-      const sq = squashRef.current;
-      if (sq) {
-        const target = pressed ? PRESSED_SCALE : REST_SCALE;
-        const t = 1 - Math.exp(-SCALE_LERP * delta);
-        sq.scale.lerp(target, t);
-      }
-      const strength = uniformsRef.current.uPressStrength;
-      const targetStrength = pressed ? PRESS_STRENGTH_MAX : 0;
-      const tt = 1 - Math.exp(-STRENGTH_LERP * delta);
-      strength.value += (targetStrength - strength.value) * tt;
-
-      if (pressed) {
-        pressTimeRef.current += delta;
-        if (pressTimeRef.current >= SHATTER_HOLD) {
-          triggerShatter();
-        }
-      } else if (pressTimeRef.current > 0) {
-        pressTimeRef.current = Math.max(0, pressTimeRef.current - delta * 2);
-      }
+  useEffect(() => {
+    if (!debug) {
+      setStatus('debug=none');
       return;
     }
-
-    const inst = fragMeshRef.current;
-    if (!inst) return;
-    const frags = fragsRef.current;
-    for (let i = 0; i < frags.length; i++) {
-      const f = frags[i];
-      f.vel.y += GRAVITY * delta;
-      f.pos.addScaledVector(f.vel, delta);
-      f.rot.x += f.angVel.x * delta;
-      f.rot.y += f.angVel.y * delta;
-      f.rot.z += f.angVel.z * delta;
-      dummy.position.copy(f.pos);
-      dummy.rotation.copy(f.rot);
-      dummy.updateMatrix();
-      inst.setMatrixAt(i, dummy.matrix);
+    const bbox = 'bbox' in debug ? debug.bbox : null;
+    if (bbox) {
+      setStatus(
+        `mesh=${debug.meshCount} bbox=${bbox.map((n) => n.toFixed(2)).join(',')} fit=${fitScale.toFixed(3)}`,
+      );
+    } else {
+      setStatus(
+        `NO_MESH meshCount=${debug.meshCount} children=${debug.sceneChildren}`,
+      );
     }
-    inst.instanceMatrix.needsUpdate = true;
+  }, [debug, fitScale, setStatus]);
+
+  useEffect(() => {
+    if (!mesh) return;
+    const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
+    const colorAttr = mesh.geometry.attributes.color as THREE.BufferAttribute;
+    const idx = mesh.geometry.index;
+    originalPositionsRef.current = new Float32Array(
+      posAttr.array as Float32Array,
+    );
+    originalColorsRef.current = new Float32Array(
+      colorAttr.array as Float32Array,
+    );
+
+    if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+      const keys = Object.keys(mesh.morphTargetDictionary);
+      const preferred = keys.find((k) => /press|squash/i.test(k)) ?? keys[0];
+      if (preferred !== undefined) {
+        morphRef.current = {
+          index: mesh.morphTargetDictionary[preferred],
+          influence: 0,
+        };
+      }
+    }
+
+    const info = {
+      vertexCount: posAttr.count,
+      triangleCount: idx ? idx.count / 3 : posAttr.count / 3,
+      hasUv: !!mesh.geometry.attributes.uv,
+      hasColor: true,
+      morphTargets: Object.keys(mesh.morphTargetDictionary ?? {}),
+    };
+    setMeshInfo(info);
+    console.log('[clay] mesh loaded:', mesh.name, info);
+  }, [mesh, setMeshInfo]);
+
+  useEffect(() => {
+    paintColorRef.current.set(selectedColor);
+  }, [selectedColor]);
+
+  useEffect(() => {
+    if (
+      resetTick === 0 ||
+      !mesh ||
+      !originalPositionsRef.current ||
+      !originalColorsRef.current
+    ) {
+      return;
+    }
+    const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
+    const colorAttr = mesh.geometry.attributes.color as THREE.BufferAttribute;
+    (posAttr.array as Float32Array).set(originalPositionsRef.current);
+    (colorAttr.array as Float32Array).set(originalColorsRef.current);
+    posAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+    if (morphRef.current && mesh.morphTargetInfluences) {
+      morphRef.current.influence = 0;
+      mesh.morphTargetInfluences[morphRef.current.index] = 0;
+    }
+  }, [resetTick, mesh]);
+
+  useEffect(() => {
+    if (!mesh) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    mats.forEach((mat) => {
+      const std = mat as THREE.MeshStandardMaterial;
+      if ('wireframe' in std) std.wireframe = wireframe;
+    });
+  }, [mesh, wireframe]);
+
+  useFrame((_, delta) => {
+    if (!mesh || !mesh.morphTargetInfluences || !morphRef.current) return;
+    const m = morphRef.current;
+    const target = isPressingRef.current && shapeKeyActive ? 1 : 0;
+    const t = 1 - Math.exp(-MORPH_LERP_SPEED * delta);
+    m.influence += (target - m.influence) * t;
+    mesh.morphTargetInfluences[m.index] = m.influence;
   });
 
-  const handlePressIn = (e: ThreeEvent<PointerEvent>) => {
-    if (phase !== 'idle') return;
-    e.stopPropagation();
-    uniformsRef.current.uPressPoint.value.copy(e.point);
-    setPressed(true);
+  const applyStroke = (e: ThreeEvent<PointerEvent>) => {
+    if (!mesh || !e.face || !originalPositionsRef.current) return;
+    const localPoint = mesh.worldToLocal(e.point.clone());
+    const localNormal = e.face.normal.clone().normalize();
+    const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
+    const colorAttr = mesh.geometry.attributes.color as THREE.BufferAttribute;
+    const orig = originalPositionsRef.current;
+    const paint = paintColorRef.current;
+    const r = DEFORM_RADIUS;
+    const r2 = r * r;
+    const maxD2 = MAX_DEPTH * MAX_DEPTH;
+    for (let i = 0; i < posAttr.count; i++) {
+      const vx = posAttr.getX(i);
+      const vy = posAttr.getY(i);
+      const vz = posAttr.getZ(i);
+      const dx = vx - localPoint.x;
+      const dy = vy - localPoint.y;
+      const dz = vz - localPoint.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > r2) continue;
+      const ratio = Math.sqrt(d2) / r;
+      const falloff = (1 - ratio) * (1 - ratio);
+      const push = DEFORM_STRENGTH * falloff;
+      let nx = vx - localNormal.x * push;
+      let ny = vy - localNormal.y * push;
+      let nz = vz - localNormal.z * push;
+      const ox = orig[i * 3];
+      const oy = orig[i * 3 + 1];
+      const oz = orig[i * 3 + 2];
+      const ddx = nx - ox;
+      const ddy = ny - oy;
+      const ddz = nz - oz;
+      const depth2 = ddx * ddx + ddy * ddy + ddz * ddz;
+      if (depth2 > maxD2) {
+        const k = MAX_DEPTH / Math.sqrt(depth2);
+        nx = ox + ddx * k;
+        ny = oy + ddy * k;
+        nz = oz + ddz * k;
+      }
+      posAttr.setXYZ(i, nx, ny, nz);
+
+      const cr = colorAttr.getX(i);
+      const cg = colorAttr.getY(i);
+      const cb = colorAttr.getZ(i);
+      const mix = falloff * PAINT_MIX;
+      colorAttr.setXYZ(
+        i,
+        cr + (paint.r - cr) * mix,
+        cg + (paint.g - cg) * mix,
+        cb + (paint.b - cb) * mix,
+      );
+    }
+    posAttr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+    setHit({ x: e.point.x, y: e.point.y, z: e.point.z });
   };
 
-  const handlePressOut = () => {
-    setPressed(false);
+  const handleDown = (e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    isPressingRef.current = true;
+    applyStroke(e);
+  };
+
+  const handleMove = (e: ThreeEvent<PointerEvent>) => {
+    if (!isPressingRef.current) return;
+    applyStroke(e);
+  };
+
+  const handleUp = () => {
+    isPressingRef.current = false;
   };
 
   return (
     <>
-      <group ref={groupRef} scale={fitScale}>
-        {phase === 'idle' && (
-          <group
-            ref={squashRef}
-            onPointerDown={handlePressIn}
-            onPointerUp={handlePressOut}
-            onPointerLeave={handlePressOut}
-            onPointerCancel={handlePressOut}
-          >
-            <primitive object={centeredScene} />
-          </group>
-        )}
-      </group>
-      {phase === 'shattered' && (
-        <instancedMesh
-          ref={fragMeshRef}
-          args={[undefined, undefined, FRAG_COUNT]}
-        >
-          <tetrahedronGeometry args={[0.12]} />
-          <meshStandardMaterial color={fragColor} roughness={0.6} />
-        </instancedMesh>
+      <mesh position={[1.5, 0, 0]}>
+        <sphereGeometry args={[0.3, 16, 16]} />
+        <meshStandardMaterial color="red" wireframe />
+      </mesh>
+      {mesh && (
+        <group scale={fitScale}>
+          <primitive
+            object={centeredScene}
+            onPointerDown={handleDown}
+            onPointerMove={handleMove}
+            onPointerUp={handleUp}
+            onPointerCancel={handleUp}
+            onPointerLeave={handleUp}
+          />
+        </group>
       )}
     </>
   );
