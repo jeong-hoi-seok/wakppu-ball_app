@@ -1,18 +1,18 @@
 # wakppu-ball_app
 
-React Native (Expo SDK 56) + TypeScript 앱.
+React Native (Expo SDK 54) + TypeScript 앱.
 
 ## 필수 문서
 
 코드 작성 전 Expo 버전 고정 문서를 참고한다.
 
-https://docs.expo.dev/versions/v56.0.0/
+https://docs.expo.dev/versions/v54.0.0/
 
 ## 스택
 
 | 영역 | 도구 |
 |---|---|
-| 프레임워크 | Expo SDK 56, expo-router (파일 기반 라우팅) |
+| 프레임워크 | Expo SDK 54, expo-router (파일 기반 라우팅) |
 | 언어 | TypeScript (`strict: true`) |
 | 스타일 | NativeWind 4 + Tailwind CSS v3 (`className`) |
 | 상태관리 | Zustand |
